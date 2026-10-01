@@ -118,11 +118,7 @@ class RampWorkflowControl:
         return self._guard(operation_id, "deicing.runway.slot.committed", subject, at, action, requirements=requirements)
 
     def apply_notam_stand_restriction(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
-        event = self.stream.publish(operation_id, utc(at), "notam.stand.restriction.applied", subject, {"operation_id": operation_id})
-        result = action()
-        receipt = OperationReceipt(operation_id, event.topic, subject, event, result)
-        self._receipts[operation_id] = receipt
-        return receipt
+        return self._guard(operation_id, "notam.stand.restriction.applied", subject, at, action, requirements=requirements)
 
     def release_maintenance_turnaround(self, operation_id: str, subject: str, at: datetime, action: Callable[[], T], requirements: tuple[Decision, ...] = ()) -> OperationReceipt:
         return self._guard(operation_id, "maintenance.turnaround.release.decided", subject, at, action, requirements=requirements)

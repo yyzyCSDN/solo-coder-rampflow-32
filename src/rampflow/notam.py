@@ -53,21 +53,23 @@ class NotamRegistry:
             return [base]
         r = n.recurrence
         z = ZoneInfo(r.zone)
-        local_start = base.start.astimezone(z).date() - timedelta(days=1)
-        local_end = base.end.astimezone(z).date() + timedelta(days=1)
+        local_start = base.start.astimezone(z).date() - timedelta(days=2)
+        local_end = base.end.astimezone(z).date() + timedelta(days=2)
         cur = local_start
         out = []
         while cur <= local_end:
             active = (cur.weekday() in r.weekdays and cur not in r.exception_dates) or cur in r.inclusion_dates
             if active:
                 start = datetime.combine(cur, r.local_start, tzinfo=z)
-                end = datetime.combine(cur, r.local_end, tzinfo=z)
-                if end > start:
-                    occurrence = Window(start, end).intersection(n.effective)
+                end_date = cur
+                if r.local_end <= r.local_start:
+                    end_date += timedelta(days=1)
+                end = datetime.combine(end_date, r.local_end, tzinfo=z)
+                occurrence = Window(start, end).intersection(n.effective)
+                if occurrence:
+                    occurrence = occurrence.intersection(horizon)
                     if occurrence:
-                        occurrence = occurrence.intersection(horizon)
-                        if occurrence:
-                            out.append(occurrence)
+                        out.append(occurrence)
             cur += timedelta(days=1)
         return out
 

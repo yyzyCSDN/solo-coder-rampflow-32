@@ -51,6 +51,15 @@ class StandMove:
     reason: str
 
 
+@dataclass(frozen=True)
+class StandReassignment:
+    flight_id: str
+    new_stand: str
+    tow_start: datetime
+    tow_duration_min: int
+    reason: str
+
+
 class StandConflict(RuntimeError):
     pass
 
@@ -84,6 +93,9 @@ class StandOrchestrator:
     def _adjacency_ok(self, stand_id: str, protected: Window, ignore: str | None = None) -> bool:
         profile = self.profiles[stand_id]
         forbidden = set(profile.incompatible_simultaneous)
+        for other_id, other in self.profiles.items():
+            if stand_id in other.incompatible_simultaneous:
+                forbidden.add(other_id)
         for other_id in forbidden:
             for assignment in self.by_stand.get(other_id, ()):
                 if assignment.flight_id == ignore:
@@ -158,6 +170,63 @@ class StandOrchestrator:
         ]
         self.generation += 1
 
+    def _reassignment_state(
+        self,
+        request: StandReassignment,
+        current: StandAssignment,
+    ) -> tuple[StandAssignment, StandMove]:
+        if request.new_stand == current.stand_id:
+            raise ValueError("new stand equals current stand")
+        if request.new_stand not in self.profiles:
+            raise KeyError(request.new_stand)
+
+        tow_start = utc(request.tow_start)
+        tow_window = Window(
+            tow_start,
+            tow_start + timedelta(minutes=request.tow_duration_min),
+        )
+        if not current.window.contains(tow_start):
+            raise StandConflict("tow must start while aircraft is on stand")
+
+        remaining = Window(tow_window.end, current.window.end)
+        protected = Window(remaining.start, current.protected_window.end)
+        updated = replace(
+            current,
+            stand_id=request.new_stand,
+            window=remaining,
+            protected_window=protected,
+            generation=self.generation,
+        )
+        move = StandMove(
+            request.flight_id,
+            current.stand_id,
+            request.new_stand,
+            tow_window,
+            request.reason,
+        )
+        return updated, move
+
+    def _shadow_stand_free(
+        self,
+        by_stand: Mapping[str, list[StandAssignment]],
+        stand_id: str,
+        protected: Window,
+        ignored_flights: frozenset[str],
+    ) -> bool:
+        profile = self.profiles[stand_id]
+        forbidden = set(profile.incompatible_simultaneous)
+        for other_id, other in self.profiles.items():
+            if stand_id in other.incompatible_simultaneous:
+                forbidden.add(other_id)
+
+        for candidate_id in (stand_id, *sorted(forbidden)):
+            for assignment in by_stand.get(candidate_id, ()):
+                if assignment.flight_id in ignored_flights:
+                    continue
+                if assignment.protected_window.overlaps(protected):
+                    return False
+        return True
+
     def reassign(
         self,
         flight_id: str,
@@ -166,43 +235,82 @@ class StandOrchestrator:
         tow_duration_min: int,
         reason: str,
     ) -> StandMove:
-        current = self.assignments[flight_id]
-        if new_stand == current.stand_id:
-            raise ValueError("new stand equals current stand")
-        if new_stand not in self.profiles:
-            raise KeyError(new_stand)
-        tow_start = utc(tow_start)
-        tow_window = Window(
-            tow_start,
-            tow_start + timedelta(minutes=tow_duration_min),
-        )
-        if not current.window.contains(tow_start):
-            raise StandConflict("tow must start while aircraft is on stand")
-        remaining = Window(tow_window.end, current.window.end)
-        protected = Window(
-            remaining.start,
-            current.protected_window.end,
-        )
-        if not self._stand_free(new_stand, protected, ignore=flight_id):
-            raise StandConflict("destination stand unavailable after tow")
-        old_stand = current.stand_id
-        self.by_stand[old_stand] = [
-            a for a in self.by_stand[old_stand] if a.flight_id != flight_id
-        ]
-        updated = replace(
-            current,
-            stand_id=new_stand,
-            window=remaining,
-            protected_window=protected,
-            generation=self.generation,
-        )
-        self.assignments[flight_id] = updated
-        self.by_stand[new_stand].append(updated)
-        self.by_stand[new_stand].sort(
-            key=lambda a: (a.protected_window.start, a.flight_id)
-        )
+        return self.reassign_many(
+            (
+                StandReassignment(
+                    flight_id,
+                    new_stand,
+                    tow_start,
+                    tow_duration_min,
+                    reason,
+                ),
+            )
+        )[0]
+
+    def reassign_many(
+        self,
+        requests: Iterable[StandReassignment],
+    ) -> tuple[StandMove, ...]:
+        requests = tuple(requests)
+        if len({r.flight_id for r in requests}) != len(requests):
+            raise ValueError("duplicate flight reassignment")
+
+        staged: dict[str, StandAssignment] = {}
+        moves: list[StandMove] = []
+        for request in requests:
+            current = self.assignments.get(request.flight_id)
+            if current is None:
+                raise KeyError(request.flight_id)
+            updated, move = self._reassignment_state(request, current)
+            staged[request.flight_id] = updated
+            moves.append(move)
+
+        final = dict(self.assignments)
+        final.update(staged)
+        final_by_stand: dict[str, list[StandAssignment]] = {
+            stand_id: [] for stand_id in self.profiles
+        }
+        for assignment in final.values():
+            final_by_stand[assignment.stand_id].append(assignment)
+
+        # Validate the complete destination layout first so a failed swap cannot
+        # leave one aircraft already moved while the other has nowhere to go.
+        staged_flights = frozenset(staged)
+        staged_rows = tuple(staged.values())
+        for left_index, left in enumerate(staged_rows):
+            left_profile = self.profiles[left.stand_id]
+            for right in staged_rows[left_index + 1 :]:
+                right_profile = self.profiles[right.stand_id]
+                same_stand = left.stand_id == right.stand_id
+                reverse_incompatible = (
+                    right.stand_id in left_profile.incompatible_simultaneous
+                    or left.stand_id in right_profile.incompatible_simultaneous
+                )
+                if (
+                    (same_stand or reverse_incompatible)
+                    and left.protected_window.overlaps(right.protected_window)
+                ):
+                    raise StandConflict("destination stand unavailable after tow")
+            if not self._shadow_stand_free(
+                final_by_stand,
+                left.stand_id,
+                left.protected_window,
+                staged_flights,
+            ):
+                raise StandConflict("destination stand unavailable after tow")
+
+        for rows in final_by_stand.values():
+            rows.sort(key=lambda a: (a.protected_window.start, a.flight_id))
+        self.assignments = final
+        self.by_stand = final_by_stand
         self.generation += 1
-        return StandMove(flight_id, old_stand, new_stand, tow_window, reason)
+        return tuple(moves)
+
+    def reassign_batch(
+        self,
+        requests: Iterable[StandReassignment],
+    ) -> tuple[StandMove, ...]:
+        return self.reassign_many(requests)
 
     def occupancy(self, stand_id: str) -> tuple[StandAssignment, ...]:
         return tuple(self.by_stand[stand_id])
