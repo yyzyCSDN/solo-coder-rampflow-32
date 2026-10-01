@@ -62,12 +62,13 @@ class NotamRegistry:
             if active:
                 start = datetime.combine(cur, r.local_start, tzinfo=z)
                 end = datetime.combine(cur, r.local_end, tzinfo=z)
-                if end > start:
-                    occurrence = Window(start, end).intersection(n.effective)
+                if end <= start:
+                    end += timedelta(days=1)
+                occurrence = Window(start, end).intersection(n.effective)
+                if occurrence:
+                    occurrence = occurrence.intersection(horizon)
                     if occurrence:
-                        occurrence = occurrence.intersection(horizon)
-                        if occurrence:
-                            out.append(occurrence)
+                        out.append(occurrence)
             cur += timedelta(days=1)
         return out
 

@@ -51,6 +51,20 @@ class StandMove:
     reason: str
 
 
+@dataclass(frozen=True)
+class StandRelocation:
+    flight_id: str
+    from_stand: str
+    to_stand: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class RemediationResult:
+    kept: tuple[str, ...]
+    relocated: tuple[StandRelocation, ...]
+
+
 class StandConflict(RuntimeError):
     pass
 
@@ -84,6 +98,9 @@ class StandOrchestrator:
     def _adjacency_ok(self, stand_id: str, protected: Window, ignore: str | None = None) -> bool:
         profile = self.profiles[stand_id]
         forbidden = set(profile.incompatible_simultaneous)
+        for other_id, other in self.profiles.items():
+            if other_id != stand_id and stand_id in other.incompatible_simultaneous:
+                forbidden.add(other_id)
         for other_id in forbidden:
             for assignment in self.by_stand.get(other_id, ()):
                 if assignment.flight_id == ignore:
@@ -206,6 +223,108 @@ class StandOrchestrator:
 
     def occupancy(self, stand_id: str) -> tuple[StandAssignment, ...]:
         return tuple(self.by_stand[stand_id])
+
+    def _pair_incompatible(self, first: str, second: str) -> bool:
+        return (
+            second in self.profiles[first].incompatible_simultaneous
+            or first in self.profiles[second].incompatible_simultaneous
+        )
+
+    def _adjacency_victim(self) -> str | None:
+        assignments = [self.assignments[fid] for fid in sorted(self.assignments)]
+        for index, first in enumerate(assignments):
+            for second in assignments[index + 1:]:
+                if not first.protected_window.overlaps(second.protected_window):
+                    continue
+                if not self._pair_incompatible(first.stand_id, second.stand_id):
+                    continue
+                later = max(
+                    (first, second),
+                    key=lambda a: (a.protected_window.start, a.flight_id),
+                )
+                return later.flight_id
+        return None
+
+    def _release_violations(
+        self, closed: Mapping[str, tuple[Window, ...]]
+    ) -> dict[str, StandAssignment]:
+        released: dict[str, StandAssignment] = {}
+
+        def drop(flight_id: str) -> None:
+            old = self.assignments.get(flight_id)
+            if old is None or flight_id in released:
+                return
+            self.release(flight_id)
+            released[flight_id] = old
+
+        for flight_id, assignment in sorted(self.assignments.items()):
+            if any(
+                assignment.protected_window.overlaps(w)
+                for w in closed.get(assignment.stand_id, ())
+            ):
+                drop(flight_id)
+        while True:
+            victim = self._adjacency_victim()
+            if victim is None:
+                break
+            drop(victim)
+        return dict(
+            sorted(
+                released.items(),
+                key=lambda item: (item[1].protected_window.start, item[0]),
+            )
+        )
+
+    def _place(
+        self, demand: StandDemand, closed: Mapping[str, tuple[Window, ...]]
+    ) -> StandAssignment:
+        protected = self._protected(demand)
+        for candidate in self.candidates(demand):
+            if any(protected.overlaps(w) for w in closed.get(candidate.stand_id, ())):
+                continue
+            return candidate
+        raise StandConflict(f"no feasible stand for {demand.flight_id}")
+
+    def remediate(
+        self,
+        demands: Mapping[str, StandDemand],
+        closures: Mapping[str, Iterable[Window]] | None = None,
+        reason: str = "restriction",
+    ) -> RemediationResult:
+        """Reconcile existing assignments with restored restrictions atomically.
+
+        Assignments that still fit keep their stand. Assignments inside a
+        closure window or in a simultaneous-incompatibility pair are migrated
+        to feasible stands. Either every affected flight is relocated or the
+        plan is restored unchanged - a failed adjustment never strands a
+        partial move.
+        """
+        closed = {sid: tuple(windows) for sid, windows in (closures or {}).items()}
+        unknown = set(closed) - set(self.profiles)
+        if unknown:
+            raise KeyError(sorted(unknown))
+        snapshot_assignments = dict(self.assignments)
+        snapshot_by_stand = {sid: list(rows) for sid, rows in self.by_stand.items()}
+        snapshot_generation = self.generation
+        try:
+            released = self._release_violations(closed)
+            relocations = []
+            for flight_id, old in released.items():
+                demand = demands.get(flight_id)
+                if demand is None:
+                    raise StandConflict(f"no demand to relocate {flight_id}")
+                placement = self._place(demand, closed)
+                self.commit(placement)
+                relocations.append(
+                    StandRelocation(flight_id, old.stand_id, placement.stand_id, reason)
+                )
+        except Exception:
+            self.assignments = snapshot_assignments
+            self.by_stand = snapshot_by_stand
+            self.generation = snapshot_generation
+            raise
+        kept = tuple(sorted(set(snapshot_assignments) - set(released)))
+        return RemediationResult(kept, tuple(relocations))
 
     def utilization(self, stand_id: str, window: Window) -> float:
         occupied = 0.0
